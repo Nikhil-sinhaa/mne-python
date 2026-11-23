@@ -2158,3 +2158,328 @@ def test_plot_raw_n_samples(raw, browser_backend):
         # rounding errors used to drop the last sample in some windows
         assert stop - start == np.ceil(fig.mne.duration * sfreq)
         assert start == raw.time_as_index(fig.mne.t_start - fig.mne.first_time)[0]
+
+
+def _drawn_traces(fig, ch_idx, overlay=None):
+    """Get the (x, y) a browser drew for a channel (primary or an overlay)."""
+    if hasattr(fig.mne, "overlay_traces") or hasattr(fig, "savefig"):
+        # (the mpl browser draws row i of the shown channels as line i)
+        row = list(fig.mne.picks).index(ch_idx)
+        line = (
+            fig.mne.traces[row]
+            if overlay is None
+            else fig.mne.overlay_traces[overlay][row]
+        )
+        return np.asarray(line.get_xdata(), float), np.asarray(line.get_ydata(), float)
+    (trace,) = [t for t in fig.mne.traces if t.ch_idx == ch_idx]
+    item = trace if overlay is None else trace.overlay_curves[overlay]
+    x, y = item.getData()
+    return np.asarray(x, float), np.asarray(y, float)
+
+
+def _check_overlay_equals_primary(fig, n_overlays=1):
+    """Overlaid identical copies must be drawn exactly like the primary traces."""
+    assert len(fig.mne.picks) > 1
+    for ch_idx in fig.mne.picks:
+        x0, y0 = _drawn_traces(fig, ch_idx)
+        for k in range(n_overlays):
+            x1, y1 = _drawn_traces(fig, ch_idx, k)
+            assert_allclose(x1, x0, atol=1e-12)
+            assert_allclose(y1, y0, atol=1e-12)
+
+
+def test_overlay_validation(raw, mpl_backend):
+    """Test the checks of the overlay arguments of plot_raw (gh-13260)."""
+    raw.pick(raw.ch_names[:6])
+    raw.del_proj()  # (can't be applied to just these channels)
+    other = raw.copy()
+    with pytest.raises(TypeError, match="overlay must be an instance of"):
+        raw.plot(overlay="foo", show=False)
+    with pytest.raises(TypeError, match=r"overlay\[0\] must be an instance of"):
+        raw.plot(overlay=[np.zeros(3)], show=False)
+    with pytest.raises(ValueError, match="at least one"):
+        raw.plot(overlay=[], show=False)
+    with pytest.raises(TypeError, match="overlay keys must be an instance of"):
+        raw.plot(overlay={1: other}, show=False)
+    with pytest.raises(ValueError, match="can only be used together"):
+        raw.plot(overlay_colors="r", show=False)
+    with pytest.raises(ValueError, match="one color per overlaid"):
+        raw.plot(overlay=[other, other], overlay_colors=["r"], show=False)
+    with pytest.raises(ValueError, match="Invalid color"):
+        raw.plot(overlay=other, overlay_colors="notacolor", show=False)
+    disjoint = raw.copy().pick(raw.ch_names[:2])
+    disjoint.rename_channels({n: n + "x" for n in disjoint.ch_names})
+    with pytest.raises(ValueError, match="none of the channels"):
+        raw.plot(overlay=disjoint, show=False)
+    # epochs aren't Raw
+    epochs = mne.make_fixed_length_epochs(raw, duration=1.0, preload=True)
+    with pytest.raises(TypeError, match="overlay must be an instance of"):
+        raw.plot(overlay=epochs, show=False)
+    # valid forms: single, list, dict; one color or one per overlay
+    fig = raw.plot(overlay=other, show=False)
+    assert [o["label"] for o in fig.mne.overlays] == ["overlay 1"]
+    assert fig.mne.overlays[0]["color"] == mcolors.to_rgba("C1")
+    fig = raw.plot(overlay=[other, other, other], overlay_colors="r", show=False)
+    assert {o["color"] for o in fig.mne.overlays} == {mcolors.to_rgba("r")}
+    fig = raw.plot(
+        overlay={"a": other, "b": other}, overlay_colors=["g", "b"], show=False
+    )
+    assert [o["label"] for o in fig.mne.overlays] == ["a", "b"]
+    assert [o["color"] for o in fig.mne.overlays] == [
+        mcolors.to_rgba("g"),
+        mcolors.to_rgba("b"),
+    ]
+    legend = fig.mne.overlay_legend
+    assert [t.get_text() for t in legend.get_texts()] == ["raw", "a", "b"]
+    # an RGB tuple is one color, not three colors
+    fig = raw.plot(overlay=[other, other], overlay_colors=(0.1, 0.2, 0.3), show=False)
+    assert len({o["color"] for o in fig.mne.overlays}) == 1
+    # nothing is overlaid by default
+    fig = raw.plot(show=False)
+    assert not fig.mne.overlays
+    assert not hasattr(fig.mne, "overlay_legend")
+
+
+def test_overlay_not_supported(raw, mpl_backend, monkeypatch):
+    """Test the error for browser backends that can't draw overlays (gh-13260)."""
+    from mne.viz._mpl_figure import MNEBrowseFigure
+
+    assert MNEBrowseFigure._supports_overlays()
+    monkeypatch.setattr(
+        MNEBrowseFigure, "_supports_overlays", classmethod(lambda cls: False)
+    )
+    n_figs = len(plt.get_fignums())
+    with pytest.raises(NotImplementedError, match="does not support overlay"):
+        raw.plot(overlay=raw.copy(), show=False)
+    assert len(plt.get_fignums()) == n_figs  # the window wasn't left open
+    raw.plot(show=False)  # without overlay, there is no problem
+
+
+@pytest.mark.parametrize("show_first_samp", (False, True))
+@pytest.mark.parametrize("duration", (2.0, 4.0))  # (4 s steps to unaligned samples)
+def test_overlay_browser(raw, browser_backend, show_first_samp, duration):
+    """Test overlaying data in the browsers of both backends (gh-13260)."""
+    kwargs = dict(duration=duration, n_channels=6, show=False)
+    kwargs.update(show_first_samp=show_first_samp)
+    if not raw.plot(**kwargs)._supports_overlays():  # e.g., mne-qt-browser <= 0.7.5
+        # (not a skip, CI doesn't allow unexpected skips)
+        with pytest.raises(NotImplementedError, match="does not support overlay"):
+            raw.plot(overlay=raw.copy(), **kwargs)
+        return
+    fig = raw.plot(overlay=raw.copy(), **kwargs)
+    _check_overlay_equals_primary(fig)
+    # keep that while navigating, changing the channels and the modes (butterfly,
+    # DC removal, zen mode)
+    for key in (
+        "right",
+        "end",
+        "home",
+        "left",
+        "down",
+        "down",
+        "up",
+        "b",
+        "b",
+        "d",
+        "d",
+        "z",
+        "z",
+    ):
+        fig._fake_keypress(key)
+        _check_overlay_equals_primary(fig)
+    # the overlay data are what is shown, scaled like the data of raw
+    assert len(fig.mne.overlay_data) == 1
+    times, data = fig.mne.overlay_data[0]
+    assert data.shape == (len(fig.mne.picks), len(times))
+
+
+def test_overlay_aligned_data(raw, mpl_backend):
+    """Test that overlays show the right samples, scaled like the data (gh-13260)."""
+    raw.pick(raw.ch_names[:12])
+    sfreq = raw.info["sfreq"]
+    filtered = raw.copy().filter(2.0, 20.0, verbose=False)
+    cropped = raw.copy().crop(tmin=2.0, tmax=8.0)  # starts later in the acquisition
+    resampled = raw.copy().resample(sfreq / 2, verbose=False)
+    subset = raw.copy().pick(raw.ch_names[3:8])
+    overlays = dict(
+        filtered=filtered, cropped=cropped, resampled=resampled, subset=subset
+    )
+    fig = raw.plot(duration=4.0, n_channels=6, show=False, proj=False, overlay=overlays)
+    scalings = fig.mne.scalings
+
+    def expected(inst, ch_name, shown_times):
+        """Compute what is shown for a channel, from the instance only."""
+        if ch_name not in inst.ch_names:
+            return None
+        # the window of the samples of raw that are shown, in acquisition time
+        tmin = raw.first_time + shown_times[0]
+        n_times = int(np.round(len(shown_times) / sfreq * inst.info["sfreq"]))
+        start = int(np.round((tmin - inst.first_time) * inst.info["sfreq"]))
+        start, stop = max(start, 0), min(start + n_times, inst.n_times)
+        if stop <= start:
+            return None
+        values = inst.get_data(picks=[ch_name], start=start, stop=stop)[0]
+        values = values - values.mean()
+        times = inst.first_time + np.arange(start, stop) / inst.info["sfreq"]
+        norm = 2 * scalings[inst.get_channel_types(picks=[ch_name])[0]]
+        return times, values / norm
+
+    for key in (None, "right", "right", "end", "left", "end", "home"):
+        if key is not None:
+            fig._fake_keypress(key)
+        assert len(fig.mne.overlay_data) == len(overlays)
+        for ovl, (label, inst) in zip(fig.mne.overlay_data, overlays.items()):
+            for row, ch_idx in enumerate(fig.mne.picks):
+                ch_name = fig.mne.ch_names[ch_idx]
+                exp = expected(inst, ch_name, fig.mne.times)
+                if exp is None or ovl is None:
+                    assert exp is None or ovl is None
+                    if ovl is not None:
+                        assert np.isnan(ovl[1][row]).all(), (label, ch_name)
+                    continue
+                times, values = exp
+                assert_allclose(
+                    ovl[0],
+                    times - raw.first_time,
+                    atol=1e-9,
+                    err_msg=f"{label} {ch_name} times",
+                )
+                assert_allclose(
+                    ovl[1][row],
+                    values,
+                    rtol=1e-6,
+                    atol=1e-12,
+                    err_msg=f"{label} {ch_name}",
+                )
+    # channels the overlay doesn't have are not drawn for it (NaN, not zeros)
+    ovl = fig.mne.overlay_data[list(overlays).index("subset")]
+    missing = [
+        r
+        for r, i in enumerate(fig.mne.picks)
+        if fig.mne.ch_names[i] not in subset.ch_names
+    ]
+    assert missing and np.isnan(ovl[1][missing]).all()
+    # the cropped copy has no data before 2 s: the overlay starts where its data starts
+    fig._fake_keypress("home")
+    fig.mne.t_start = 0.0
+    fig._redraw()
+    times, _ = fig.mne.overlay_data[list(overlays).index("cropped")]
+    assert_allclose(times[0], 2.0, atol=1 / sfreq)
+
+
+def test_overlay_annotations(raw, mpl_backend):
+    """Test that annotation edits also edit the overlaid data (gh-13260)."""
+    from mne.viz import ui_events
+
+    raw.set_annotations(None)
+    raw.pick(raw.ch_names[:6])
+    raw.del_proj()  # (can't be applied to just these channels)
+    same = raw.copy()
+    cropped = raw.copy().crop(tmin=3.0)  # first annotation is before its data
+    fig = raw.plot(duration=10.0, n_channels=6, show=False, overlay=[same, cropped])
+    kw = dict(xform="data", button=1, kind="drag")
+    t0 = raw.first_time
+    # add (spans the start of the cropped copy: clipped)
+    _add_annotation_label(fig, "test")
+    fig._fake_click((1.0, 1.0), add_points=[(5.0, 1.0)], **kw)
+    assert len(raw.annotations) == 1
+    assert _annot_tuples(same.annotations) == _annot_tuples(raw.annotations)
+    assert len(cropped.annotations) == 1
+    assert_allclose(cropped.annotations.onset - cropped.first_time, [0.0], atol=1e-6)
+    assert_allclose(
+        cropped.annotations.onset[0] + cropped.annotations.duration[0] - t0,
+        5.0,
+        atol=0.05,
+    )
+    # entirely before the data of the cropped copy: not added there
+    fig._fake_click((0.5, 1.0), add_points=[(2.0, 1.0)], **kw)
+    assert len(raw.annotations) == 1  # merged with the first one (same label)
+    # a second one, later on
+    fig._fake_click((7.0, 1.0), add_points=[(8.0, 1.0)], **kw)
+    assert len(raw.annotations) == 2
+    assert _annot_tuples(same.annotations) == _annot_tuples(raw.annotations)
+    assert len(cropped.annotations) == 2
+    # remove it again (right click on it)
+    fig._fake_click((7.5, 1.0), xform="data", button=3, kind="press")
+    assert len(raw.annotations) == 1
+    assert _annot_tuples(same.annotations) == _annot_tuples(raw.annotations)
+    assert len(cropped.annotations) == 1
+    # a linked browser edits the shown data and its overlays too
+    other = raw.copy()
+    other.set_annotations(None)
+    other_overlay = other.copy()
+    fig2 = other.plot(duration=10.0, n_channels=6, show=False, overlay=other_overlay)
+    ui_events.link(fig, fig2)
+    fig._fake_click((7.0, 1.0), add_points=[(8.0, 1.0)], **kw)
+    # (only the edit is transferred: annotations that already differ aren't merged)
+    assert len(raw.annotations) == len(same.annotations) == 2
+    assert len(other.annotations) == len(other_overlay.annotations) == 1
+    assert _annot_tuples(other_overlay.annotations) == _annot_tuples(other.annotations)
+    assert _annot_tuples(other.annotations) == _annot_tuples(raw.annotations)[1:]
+    fig._fake_click((7.5, 1.0), xform="data", button=3, kind="press")
+    assert len(raw.annotations) == len(same.annotations) == 1
+    assert len(other.annotations) == len(other_overlay.annotations) == 0
+    # the other direction
+    _add_annotation_label(fig2, "other")
+    fig2._fake_click((4.0, 1.0), add_points=[(4.5, 1.0)], **kw)
+    assert len(raw.annotations) == len(same.annotations) == 2
+    assert len(other.annotations) == len(other_overlay.annotations) == 1
+    assert _annot_tuples(other_overlay.annotations) == _annot_tuples(other.annotations)
+    assert _annot_tuples(other.annotations) == _annot_tuples(raw.annotations)[1:]
+    assert len(cropped.annotations) == 2  # (and the overlays of the first browser)
+
+
+def test_overlay_gc(raw, mpl_backend):
+    """Test that browsers with overlays are freed after closing (gh-13260)."""
+    import gc
+    import weakref
+
+    raw.pick(raw.ch_names[:4])
+    raw.del_proj()
+    fig = raw.plot(overlay=raw.copy())
+    fig._fake_keypress("right")
+    ref = weakref.ref(fig)
+    plt.close(fig)
+    del fig
+    gc.collect()
+    assert ref() is None
+
+
+def test_overlay_annotations_backends(raw, browser_backend):
+    """Test that annotating also annotates the overlays, in each backend (gh-13260)."""
+    ismpl = browser_backend.name == "matplotlib"
+    raw.set_annotations(None)
+    raw.pick(raw.ch_names[:6])
+    raw.del_proj()  # (can't be applied to just these channels)
+    kwargs = dict(duration=5.0, n_channels=6, show=False)
+    if not raw.plot(**kwargs)._supports_overlays():  # e.g., mne-qt-browser <= 0.7.5
+        return  # (not a skip, CI doesn't allow unexpected skips)
+    other = raw.copy()
+    cropped = raw.copy().crop(tmin=1.0)  # starts later in the acquisition
+    fig = raw.plot(overlay=[other, cropped], **kwargs)
+    t0 = raw.first_time
+    if ismpl:
+        _add_annotation_label(fig, "test")
+        description = "BAD_test"
+    else:
+        fig._fake_keypress("a")  # annotation mode
+        description = "BAD test"
+        fig.mne.fig_annotation._add_description(description)
+    kw = dict(xform="data", button=1, kind="drag")
+    fig._fake_click((0.5, 1.0), add_points=[(3.0, 1.0)], **kw)
+    assert len(raw.annotations) == 1
+    assert _annot_tuples(other.annotations) == _annot_tuples(raw.annotations)
+    # clipped to what the cropped copy has
+    assert len(cropped.annotations) == 1
+    assert_allclose(cropped.annotations.onset, [cropped.first_time], atol=1e-6)
+    end = raw.annotations.onset[0] + raw.annotations.duration[0]
+    assert_allclose(cropped.annotations.onset[0] + cropped.annotations.duration[0], end)
+    assert list(cropped.annotations.description) == [description]
+    assert t0 == raw.first_time
+    # remove it again
+    fig._fake_keypress("a")  # (leave annotation mode to check the other path)
+    fig._fake_keypress("a")
+    fig._fake_click((2.0, 1.0), xform="data", button=3, kind="press")
+    assert len(raw.annotations) == 0
+    assert len(other.annotations) == 0
+    assert len(cropped.annotations) == 0

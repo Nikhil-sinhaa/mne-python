@@ -88,6 +88,8 @@ def plot_raw(
     precompute=None,
     use_opengl=None,
     picks=None,
+    overlay=None,
+    overlay_colors=None,
     theme=None,
     overview_mode=None,
     splash=True,
@@ -314,6 +316,30 @@ def plot_raw(
         :term:`data channels`. None (default) will pick all channels. Bad channels
         are included by default. Note that channels in ``info['bads']`` *will be
         included* if their names or indices are explicitly provided.
+    overlay : instance of Raw | list of Raw | dict of Raw | None
+        Other :class:`~mne.io.Raw` objects (e.g., a filtered or otherwise cleaned
+        copy of ``raw``) to draw in the same window, on top of the traces of
+        ``raw``. Channels are matched by name; channels the other objects don't
+        have are shown without an overlay. The data are aligned by acquisition
+        time (as for :func:`mne.viz.ui_events.link`), so a cropped copy lines up
+        with ``raw``, and the sampling frequencies may differ. Scrolling, zooming
+        and annotating work as usual, and annotation edits are applied to the
+        overlaid objects as well (clipped to their data and channels). Every
+        object gets its own color (see ``overlay_colors``) and a legend entry;
+        use a :class:`dict` to give them names (the keys), otherwise they are
+        called ``"overlay 1"``, ``"overlay 2"``, and so on. The overlaid data are
+        displayed like those of ``raw`` (projectors, ``noise_cov``,
+        ``remove_dc`` and ``scalings``), except for ``highpass`` and
+        ``lowpass``, which only filter ``raw``, so pass already filtered data.
+        None (default) shows only ``raw``.
+
+        .. versionadded:: 1.14
+    overlay_colors : color | list of color | None
+        The colors of the ``overlay`` traces, one per overlaid object (a single
+        color is used for all of them). None (default) uses the default
+        matplotlib color cycle, starting at the second color.
+
+        .. versionadded:: 1.14
     theme : str | path-like
         Can be "auto", "light", or "dark" or a path-like to a
         custom stylesheet. For Dark-Mode and automatic Dark-Mode-Detection,
@@ -432,6 +458,7 @@ def plot_raw(
     if scalings["whitened"] == "auto":
         scalings["whitened"] = 1.0
     _validate_type(raw, BaseRaw, "raw", "Raw")
+    overlays = _check_overlays(raw, overlay, overlay_colors)
     decim, picks_data = _handle_decim(info, decim, lowpass)
     noise_cov = _check_cov(noise_cov, info)
     units = _handle_default("units", None)
@@ -584,6 +611,7 @@ def plot_raw(
         zero_line_visible=show_zero_line,
         window_title=title,
         bgcolor=bgcolor,
+        overlays=overlays,
         # Qt-specific
         precompute=precompute,
         use_opengl=use_opengl,
@@ -596,6 +624,62 @@ def plot_raw(
     fig = _get_browser(show=show, block=block, **params)
 
     return fig
+
+
+def _check_overlays(raw, overlay, overlay_colors):
+    """Check the ``overlay`` and ``overlay_colors`` arguments of plot_raw."""
+    import matplotlib
+    from matplotlib.colors import to_rgba
+
+    from ..io import BaseRaw
+
+    if overlay is None:
+        if overlay_colors is not None:
+            raise ValueError("overlay_colors can only be used together with overlay")
+        return list()
+    _validate_type(overlay, (BaseRaw, list, tuple, dict), "overlay")
+    if isinstance(overlay, BaseRaw):
+        overlay = [overlay]
+    if isinstance(overlay, dict):
+        labels, insts = list(overlay.keys()), list(overlay.values())
+        for label in labels:
+            _validate_type(label, str, "overlay keys")
+    else:
+        insts = list(overlay)
+        labels = [f"overlay {ii}" for ii in range(1, len(insts) + 1)]
+    if len(insts) == 0:
+        raise ValueError("overlay must contain at least one Raw object")
+    for ii, inst in enumerate(insts):
+        _validate_type(inst, BaseRaw, f"overlay[{ii}]", "Raw")
+        if not set(inst.ch_names) & set(raw.ch_names):
+            raise ValueError(
+                f"overlay[{ii}] ({labels[ii]!r}) has none of the channels of raw, so "
+                "there is nothing to overlay"
+            )
+    if overlay_colors is None:
+        # C0 is the default for the data of raw
+        n_cycle = len(matplotlib.rcParams["axes.prop_cycle"])
+        colors = [f"C{1 + ii % max(n_cycle - 1, 1)}" for ii in range(len(insts))]
+    elif isinstance(overlay_colors, list | tuple) and not (
+        len(overlay_colors) in (3, 4)
+        and all(isinstance(c, int | float) for c in overlay_colors)
+    ):
+        colors = list(overlay_colors)
+        if len(colors) != len(insts):
+            raise ValueError(
+                f"overlay_colors must have one color per overlaid object "
+                f"({len(insts)}), got {len(colors)}"
+            )
+    else:
+        colors = [overlay_colors] * len(insts)
+    try:
+        colors = [to_rgba(color) for color in colors]
+    except ValueError as exc:
+        raise ValueError(f"Invalid color in overlay_colors: {exc}") from None
+    return [
+        dict(inst=inst, label=label, color=color)
+        for inst, label, color in zip(insts, labels, colors)
+    ]
 
 
 @legacy(alt="Raw.compute_psd().plot()")

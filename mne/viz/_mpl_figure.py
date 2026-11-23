@@ -2396,12 +2396,115 @@ class MNEBrowseFigure(BrowserBase, MNEFigure):
                 line.set_zorder(this_z)
         # update xlim
         self.mne.ax_main.set_xlim(*time_range)
+        # overlays
+        if self._overlays:
+            self._draw_overlay_traces()
         # draw scalebars maybe
         if self.mne.scalebars_visible:
             self._show_scalebars()
         # redraw event lines
         if self.mne.event_times is not None:
             self._draw_event_lines()
+
+    def _draw_overlay_traces(self):
+        """Draw (or redraw) the data of the overlays on top of the traces."""
+        picks = self.mne.picks
+        overlay_data = getattr(self.mne, "overlay_data", None)
+        if overlay_data is None or any(
+            data is not None and data[1].shape[0] != len(picks) for data in overlay_data
+        ):
+            self._update_overlay_data()  # e.g., the channels changed
+            overlay_data = self.mne.overlay_data
+        if not hasattr(self.mne, "overlay_traces"):
+            self.mne.overlay_traces = [list() for _ in self._overlays]
+        offset_ixs = (
+            picks
+            if self.mne.butterfly and self.mne.ch_selections is None
+            else slice(None)
+        )
+        offsets = self.mne.trace_offsets[offset_ixs]
+        ch_names = self.mne.ch_names[picks]
+        is_bad = np.isin(ch_names, self.mne.info["bads"])
+        data_picks_mask = np.isin(picks, self.mne.picks_data)
+        ylim = self.mne.ax_main.get_ylim()
+        trace_kwargs = dict(self.mne.trace_kwargs)
+        trace_kwargs["linewidth"] = max(trace_kwargs.get("linewidth", 0.5), 0.5) * 1.2
+        sfreq = self.mne.info["sfreq"]
+        for overlay, lines, loaded in zip(
+            self._overlays, self.mne.overlay_traces, overlay_data
+        ):
+            n_lines = 0 if loaded is None else len(picks)
+            # add or remove lines if needed
+            if n_lines > len(lines):
+                lines.extend(
+                    self.mne.ax_main.plot(
+                        np.full((1, n_lines - len(lines)), np.nan),
+                        color=overlay["color"],
+                        label="_nolegend_",
+                        **trace_kwargs,
+                    )
+                )
+            for line in lines[n_lines:]:
+                line.remove()
+            del lines[n_lines:]
+            if loaded is None:
+                continue
+            times, data = loaded
+            times = times + self.mne.first_time
+            overlay_sfreq = overlay["inst"].info["sfreq"]
+            decim = max(1, int(round(self.mne.decim * overlay_sfreq / sfreq)))
+            for ii, line in enumerate(lines):
+                this_data = offsets[ii] - data[ii] * self.mne.scale_factor
+                this_times = times
+                if data_picks_mask[ii] and decim > 1:
+                    this_times, this_data = times[::decim], this_data[::decim]
+                if self.mne.clipping == "clamp":
+                    this_data = np.clip(this_data, -0.5, 0.5)
+                elif self.mne.clipping is not None:
+                    from matplotlib.patches import Rectangle
+
+                    clip = self.mne.clipping * (0.2 if self.mne.butterfly else 1)
+                    bottom = max(offsets[ii] - clip, ylim[1])
+                    height = min(2 * clip, ylim[0] - bottom)
+                    time_range = (self.mne.times + self.mne.first_time)[[0, -1]]
+                    line.set_clip_path(
+                        Rectangle(
+                            xy=np.array([time_range[0], bottom]),
+                            width=time_range[1] - time_range[0],
+                            height=height,
+                            transform=self.mne.ax_main.transData,
+                        )
+                    )
+                line.set_xdata(this_times)
+                line.set_ydata(this_data)
+                line.set_color(overlay["color"])
+                line.set_zorder(self.mne.zorder["bads" if is_bad[ii] else "data"] + 0.5)
+        self._update_overlay_legend()
+
+    def _update_overlay_legend(self):
+        """Show which color is which (the data of raw and of each overlay)."""
+        from matplotlib.lines import Line2D
+
+        old = getattr(self.mne, "overlay_legend", None)
+        if old is not None:
+            old.remove()
+        handles = [
+            Line2D([], [], color=self.mne.fgcolor, linewidth=1.5, label="raw"),
+            *[
+                Line2D([], [], color=o["color"], linewidth=1.5, label=o["label"])
+                for o in self._overlays
+            ],
+        ]
+        legend = self.mne.ax_main.legend(
+            handles=handles,
+            loc="upper right",
+            fontsize="small",
+            framealpha=0.7,
+            facecolor=self.mne.bgcolor,
+            labelcolor=self.mne.fgcolor,
+        )
+        legend.set_zorder(self.mne.zorder["ann_text"] + 1)
+        self.mne.overlay_legend = legend
 
     def _redraw(self, update_data=True, annotations=False, *, skip_hscroll=False):
         """Redraw (convenience method for frequently grouped actions)."""

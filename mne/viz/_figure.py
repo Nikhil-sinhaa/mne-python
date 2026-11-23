@@ -7,6 +7,7 @@
 import importlib
 import inspect
 import re
+import warnings
 import weakref
 from abc import ABC, abstractmethod
 from collections import Counter, OrderedDict
@@ -464,6 +465,8 @@ class BrowserBase(ABC):
         norms[white] = self.mne.scalings["whitened"]
         norms[norms == 0] = 1
         data /= 2 * norms[:, np.newaxis]
+        if thread is None:  # (not the thread that precomputes all channels)
+            self.mne.data_norms = norms  # the overlays are scaled in the same way
         self.mne.zero_line_offset = (
             dc_offset[:, 0] / (2 * norms) if dc_offset is not None else None
         )
@@ -508,6 +511,7 @@ class BrowserBase(ABC):
         # set the data as attributes
         self.mne.data = data
         self.mne.times = times
+        self._update_overlay_data()
 
     def _get_epoch_num_from_time(self, time):
         epoch_nums = self.mne.inst.selection
@@ -568,6 +572,122 @@ class BrowserBase(ABC):
         # Remove our UI-event channel (matplotlib figures do this on close_event)
         if not isinstance(self, FigureBase) and self in _event_channels:
             _delete_event_channel(weakfig=weakref.ref(self))
+
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+    # OVERLAYS (more Raw objects drawn on top of the traces, see plot_raw)
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+    # Backends opt in by implementing _draw_overlay_traces(), which draws
+    # self.mne.overlay_data (one entry per overlay, see _update_overlay_data()).
+
+    @classmethod
+    def _supports_overlays(cls):
+        """Whether this browser backend can draw overlays."""
+        return cls._draw_overlay_traces is not BrowserBase._draw_overlay_traces
+
+    def _draw_overlay_traces(self):
+        """Draw self.mne.overlay_data (only called when there are overlays)."""
+        raise NotImplementedError
+
+    @property
+    def _overlays(self):
+        return getattr(self.mne, "overlays", None) or []
+
+    def _update_overlay_data(self):
+        """Load the data of the overlays for the current time window.
+
+        Sets ``self.mne.overlay_data`` to a list with, for each overlay, a tuple
+        ``(times, data)`` or None (nothing to show). ``times`` are like
+        ``self.mne.times`` (the backends add ``self.mne.first_time`` where needed)
+        and ``data`` has one row per shown channel (``self.mne.picks``),
+        scaled like ``self.mne.data`` (rows of channels the overlay doesn't have are
+        NaN).
+        """
+        self.mne.overlay_data = list()
+        if not self._overlays or self.mne.is_epochs:
+            return
+        norms = getattr(self.mne, "data_norms", None)
+        times = getattr(self.mne, "times", None)
+        if norms is None or times is None or len(norms) != len(self.mne.picks):
+            return  # the data of the primary instance isn't loaded yet
+        # The window of the samples we show (not what t_start and duration say, as
+        # those can be off by a sample), in acquisition time.
+        first_time = self.mne.inst._first_time
+        tmin = first_time + times[0]
+        tmax = first_time + times[-1] + 1 / self.mne.info["sfreq"]
+        for overlay in self._overlays:
+            self.mne.overlay_data.append(
+                self._load_overlay_data(overlay, tmin, tmax, norms)
+            )
+
+    def _overlay_projector(self, overlay):
+        """Get the operator that projects (and whitens) the data of an overlay.
+
+        It is what is applied to the data we show (the projectors that are
+        currently on, the bads and the noise covariance), computed for the channels
+        of the overlay. It is cached until one of those changes.
+        """
+        from .utils import _setup_plot_projector
+
+        key = (
+            tuple(p["desc"] for p in self.mne.info["projs"]),
+            tuple(self.mne.info["bads"]),
+            bool(getattr(self.mne, "use_noise_cov", False)),
+        )
+        if overlay.get("projector_key") != key:
+            info = overlay["inst"].info.copy()
+            with info._unlock():
+                info["projs"] = [deepcopy(proj) for proj in self.mne.info["projs"]]
+                info["bads"] = list(self.mne.info["bads"])
+            overlay["projector"], _ = _setup_plot_projector(
+                info,
+                getattr(self.mne, "noise_cov", None),
+                True,
+                getattr(self.mne, "use_noise_cov", False),
+            )
+            overlay["projector_key"] = key
+        return overlay["projector"]
+
+    def _load_overlay_data(self, overlay, tmin, tmax, norms):
+        """Load, process and scale the data of one overlay (None if no data)."""
+        inst = overlay["inst"]
+        ch_names = self.mne.ch_names[self.mne.picks]
+        sfreq = inst.info["sfreq"]
+        # Counting from the first sample (instead of converting both ends to
+        # samples) keeps rounding errors from dropping the last sample.
+        start = int(np.round((tmin - inst._first_time) * sfreq))
+        stop = start + int(np.round((tmax - tmin) * sfreq))
+        start, stop = max(start, 0), min(stop, inst.n_times)
+        if stop - start < 1:
+            return None
+        rows = [
+            (row, inst.ch_names.index(name))
+            for row, name in enumerate(ch_names)
+            if name in inst.ch_names
+        ]
+        if not rows:
+            return None
+        out_rows, in_picks = (np.array(idx) for idx in zip(*rows))
+        # like what we show: project (and whiten), remove the DC, and scale
+        data = np.full((len(ch_names), stop - start), np.nan)
+        projector = self._overlay_projector(overlay)
+        loaded = inst.get_data(start=start, stop=stop)
+        data[out_rows] = (
+            loaded[in_picks] if projector is None else (projector[in_picks] @ loaded)
+        )
+        if self.mne.remove_dc:
+            with warnings.catch_warnings():  # all-NaN rows (e.g., no noise cov)
+                warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+                data -= np.nanmean(data, axis=1, keepdims=True)
+        data /= 2 * norms[:, np.newaxis]
+        # the same kind of times as self.mne.times: relative to the first sample of
+        # the instance we show (the backends add self.mne.first_time if needed)
+        offset = inst._first_time - self.mne.inst._first_time
+        return offset + np.arange(start, stop) / sfreq, data
+
+    def _apply_overlay_annotations(self, added, removed):
+        """Apply annotation edits to the overlays, clipped to their data."""
+        for overlay in self._overlays:
+            self._apply_annotations_change(added, removed, inst=overlay["inst"])
 
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # UI EVENTS (keep linked browsers in sync, see mne.viz.ui_events.link)
@@ -688,6 +808,7 @@ class BrowserBase(ABC):
         added = tuple(sorted((new - old).elements()))
         removed = tuple(sorted((old - new).elements()))
         if added or removed:
+            self._apply_overlay_annotations(added, removed)
             with self._publishing():
                 publish(self, AnnotationsChange(added=added, removed=removed))
         self.mne.annotations_snapshot = new
@@ -716,16 +837,17 @@ class BrowserBase(ABC):
         expected = (self.mne.annotations_snapshot - Counter(removed)) + Counter(added)
         if self._annotations_snapshot() != expected:
             self._apply_annotations_change(added, removed)
+        self._apply_overlay_annotations(added, removed)
         self.mne.annotations_snapshot = self._annotations_snapshot()
         self._refresh_annotations(new_labels=self._update_annotation_labels())
 
-    def _clip_annotation(self, onset, duration, ch_names):
+    def _clip_annotation(self, onset, duration, ch_names, inst=None):
         """Clip an annotation to our data, like raw.set_annotations() does.
 
         Returns None if it's outside of our data or only for channels we don't
         have.
         """
-        inst = self.mne.inst
+        inst = self.mne.inst if inst is None else inst
         data_start = inst._first_time
         data_stop = data_start + inst.n_times / inst.info["sfreq"]
         start, stop = max(onset, data_start), min(onset + duration, data_stop)
@@ -734,12 +856,13 @@ class BrowserBase(ABC):
             return None
         return start, stop - start, our_ch_names
 
-    def _matching_annotations(self, onset, duration, description, ch_names):
+    def _matching_annotations(self, onset, duration, description, ch_names, inst=None):
         """Get the indices of our annotations that are the given one."""
-        annotations = self.mne.inst.annotations
+        inst = self.mne.inst if inst is None else inst
+        annotations = inst.annotations
         # Onsets may differ by rounding errors when the annotations were
         # transferred between objects, so we allow for half a sample of slack.
-        atol = 0.5 / self.mne.info["sfreq"]
+        atol = 0.5 / inst.info["sfreq"]
         match = (
             np.isclose(annotations.onset, onset, rtol=0, atol=atol)
             & np.isclose(annotations.duration, duration, rtol=0, atol=atol)
@@ -748,24 +871,26 @@ class BrowserBase(ABC):
         )
         return np.flatnonzero(match)
 
-    def _apply_annotations_change(self, added, removed):
+    def _apply_annotations_change(self, added, removed, inst=None):
         """Remove and add annotations as a linked figure did.
 
         Only what's missing is added and only what's there is removed, so applying
         the same edit twice (e.g., because we share our annotations with the
-        figure that made it) doesn't do any harm.
+        figure that made it) doesn't do any harm. The edits are applied to ``inst``
+        (default: the instance we show).
         """
-        annotations = self.mne.inst.annotations
+        inst = self.mne.inst if inst is None else inst
+        annotations = inst.annotations
         to_delete = list()
         for onset, duration, description, ch_names in removed:
-            clipped = self._clip_annotation(onset, duration, ch_names)
+            clipped = self._clip_annotation(onset, duration, ch_names, inst)
             if clipped is None:
                 continue  # we never had it
             onset, duration, ch_names = clipped
             match = [
                 idx
                 for idx in self._matching_annotations(
-                    onset, duration, description, ch_names
+                    onset, duration, description, ch_names, inst
                 )
                 if idx not in to_delete
             ]
@@ -774,12 +899,12 @@ class BrowserBase(ABC):
         annotations.delete(to_delete)
         for key, n_added in Counter(added).items():
             onset, duration, description, ch_names = key
-            clipped = self._clip_annotation(onset, duration, ch_names)
+            clipped = self._clip_annotation(onset, duration, ch_names, inst)
             if clipped is None:
                 continue
             onset, duration, ch_names = clipped
             n_have = len(
-                self._matching_annotations(onset, duration, description, ch_names)
+                self._matching_annotations(onset, duration, description, ch_names, inst)
             )
             for _ in range(n_added - n_have):
                 annotations.append(
@@ -1043,6 +1168,22 @@ def _get_browser(show, block, **kwargs):
     get_browser_backend()  # sets the module-level `backend` used just below
     # Initialize Browser
     fig = backend._init_browser(**kwargs)
+    from matplotlib.figure import FigureBase
+
+    if kwargs.get("overlays") and not fig._supports_overlays():
+        # don't silently show a window without what was asked for
+        name = get_browser_backend()
+        if isinstance(fig, FigureBase):
+            from matplotlib.pyplot import close
+
+            close(fig)
+        else:
+            fig.close()
+        raise NotImplementedError(
+            f"The installed {name!r} browser backend does not support overlay. "
+            "Use the 'matplotlib' backend (mne.viz.set_browser_backend('matplotlib')) "
+            "or update mne-qt-browser."
+        )
     if fig._supports_ui_events():  # e.g., older mne-qt-browser versions don't
         fig._setup_ui_events()
     _show_browser(show=show, block=block, fig=fig)
@@ -1110,6 +1251,8 @@ def set_browser_backend(backend_name, verbose=None):
        | Toggle Projections                   | ✓          | ✓  |
        +--------------------------------------+------------+----+
        | Butterfly Mode                       | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Overlay Raw Objects (``overlay``)    | ✓          | ✓  |
        +--------------------------------------+------------+----+
        | Selection Mode                       | ✓          | ✓  |
        +--------------------------------------+------------+----+

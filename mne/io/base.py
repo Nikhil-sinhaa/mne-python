@@ -2679,6 +2679,8 @@ class BaseRaw(
         precompute: bool | str | None = None,
         use_opengl: bool | None = None,
         picks: str | np.ndarray | slice | None = None,
+        overlay: "BaseRaw | list | dict | None" = None,
+        overlay_colors: "Color | list | None" = None,
         theme: str | Path | None = None,
         overview_mode: str | None = None,
         splash: bool = True,
@@ -2903,6 +2905,30 @@ class BaseRaw(
             :term:`data channels`. None (default) will pick all channels. Bad channels
             are included by default. Note that channels in ``info['bads']`` *will be
             included* if their names or indices are explicitly provided.
+        overlay : instance of Raw | list of Raw | dict of Raw | None
+            Other :class:`~mne.io.Raw` objects (e.g., a filtered or otherwise cleaned
+            copy of ``raw``) to draw in the same window, on top of the traces of
+            ``raw``. Channels are matched by name; channels the other objects don't
+            have are shown without an overlay. The data are aligned by acquisition
+            time (as for :func:`mne.viz.ui_events.link`), so a cropped copy lines up
+            with ``raw``, and the sampling frequencies may differ. Scrolling, zooming
+            and annotating work as usual, and annotation edits are applied to the
+            overlaid objects as well (clipped to their data and channels). Every
+            object gets its own color (see ``overlay_colors``) and a legend entry;
+            use a :class:`dict` to give them names (the keys), otherwise they are
+            called ``"overlay 1"``, ``"overlay 2"``, and so on. The overlaid data are
+            displayed like those of ``raw`` (projectors, ``noise_cov``,
+            ``remove_dc`` and ``scalings``), except for ``highpass`` and
+            ``lowpass``, which only filter ``raw``, so pass already filtered data.
+            None (default) shows only ``raw``.
+
+            .. versionadded:: 1.14
+        overlay_colors : color | list of color | None
+            The colors of the ``overlay`` traces, one per overlaid object (a single
+            color is used for all of them). None (default) uses the default
+            matplotlib color cycle, starting at the second color.
+
+            .. versionadded:: 1.14
         theme : str | path-like
             Can be "auto", "light", or "dark" or a path-like to a
             custom stylesheet. For Dark-Mode and automatic Dark-Mode-Detection,
@@ -3040,6 +3066,8 @@ class BaseRaw(
             precompute=precompute,
             use_opengl=use_opengl,
             picks=picks,
+            overlay=overlay,
+            overlay_colors=overlay_colors,
             theme=theme,
             overview_mode=overview_mode,
             splash=splash,
