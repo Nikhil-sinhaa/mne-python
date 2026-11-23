@@ -5,6 +5,7 @@
 import copy
 import os
 import shutil
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from os import path as op
 
@@ -294,7 +295,11 @@ def test_read_ctf(tmp_path):
         # test bad segment annotations
         if "testdata_ctf_short.ds" in fname:
             assert "bad" in raw.annotations.description[0]
-            assert_allclose(raw.annotations.onset, [2.15])
+            # onsets are relative to meas_date (the sync trigger), the data starts
+            # 2 s after it (pre_trig_pts == -2400)
+            assert_allclose(raw.first_time, 2.0)
+            assert_allclose(raw.annotations.onset, [4.15])
+            assert_allclose(raw.annotations.onset - raw.first_time, [2.15])
             assert_allclose(raw.annotations.duration, [0.0225])
 
     with pytest.raises(TypeError, match="path-like"):
@@ -673,6 +678,87 @@ def test_read_ctf_annotations_smoke_test():
 
     raw = read_raw_ctf(fname)
     _assert_annotations_equal(raw.annotations, annot, 1e-6)
+
+
+@testing.requires_testing_data
+@pytest.mark.parametrize(
+    "fname, pre_trig_pts",
+    [
+        (ctf_fname_catch, 624),  # recording starts before the trigger
+        (ctf_fname_somato, 62),
+        (ctf_fname_continuous, 0),
+        (ctf_fname_1_trial, -2400),  # recording starts after the trigger
+    ],
+)
+def test_ctf_pre_trigger_times(fname, pre_trig_pts, tmp_path):
+    """Test that the pre-trigger baseline is reflected in first_samp (#9653)."""
+    sfreq = 1250.0 if fname in (ctf_fname_catch, ctf_fname_somato) else 1200.0
+    ctx = (
+        pytest.warns(RuntimeWarning, match="RMSP .* changed to a MISC ch")
+        if fname == ctf_fname_catch
+        else nullcontext()
+    )
+    with ctx:
+        raw = read_raw_ctf(ctf_dir / fname, preload=False)
+    assert raw.info["sfreq"] == sfreq
+    n_times = len(raw.times)
+    # first sample is at -pre_trig_pts relative to the trigger (t=0)
+    assert raw.first_samp == -pre_trig_pts
+    assert raw.last_samp == -pre_trig_pts + n_times - 1
+    assert_allclose(raw.first_time, -pre_trig_pts / sfreq)
+    assert raw.times[0] == 0.0  # .times is always relative to first_samp
+    # the sample at the trigger is where time_as_index (relative to first_samp) says
+    data = raw.get_data()
+    trigger_idx = pre_trig_pts
+    if 0 <= trigger_idx < n_times:
+        assert raw.time_as_index(-raw.first_time)[0] == trigger_idx
+    # reading in pieces (and after cropping) gives the same data
+    mid = n_times // 2
+    assert_allclose(raw.get_data(start=mid, stop=mid + 7), data[:, mid : mid + 7])
+    i0, i1 = int(round(0.1 * sfreq)), int(round(0.3 * sfreq))
+    raw_crop = raw.copy().crop(i0 / sfreq, i1 / sfreq)
+    assert raw_crop.first_samp == -pre_trig_pts + i0
+    assert_allclose(raw_crop.get_data(), data[:, i0 : i1 + 1])
+    # FIF round trip keeps the time axis
+    out = tmp_path / "ctf_raw.fif"
+    raw.save(out)
+    raw_fif = read_raw_fif(out)
+    assert raw_fif.first_samp == raw.first_samp
+    assert_allclose(raw_fif.first_time, raw.first_time)
+    assert_allclose(raw_fif.get_data(), data, atol=1e-15)
+
+
+@testing.requires_testing_data
+def test_ctf_pre_trigger_annotations(tmp_path):
+    """Test that annotations stay aligned with the data with a pre-trigger (#9653)."""
+    ds = tmp_path / ctf_fname_catch
+    copytree_rw(ctf_dir / ctf_fname_catch, ds)
+    sfreq = 1250.0
+    pre_trig = 624 / sfreq
+    shutil.copy(ctf_dir / "testdata_ctf_mc.ds" / "MarkerFile.mrk", ds)
+    (ds / "bad.segments").write_text("1\t1.0\t1.5\n")
+    with (
+        pytest.warns(RuntimeWarning, match="RMSP .* changed to a MISC ch"),
+        # some of the (borrowed) markers are after the end of this short recording
+        pytest.warns(RuntimeWarning, match="Omitted 11 annotation"),
+    ):
+        raw = read_raw_ctf(ds)
+    assert_allclose(raw.first_time, -pre_trig)
+    marker = raw.annotations.description == "HDAC006"
+    bad = raw.annotations.description == "bad_1"
+    assert marker.sum() == 25 and bad.sum() == 1
+    # annotations are in "time since the trigger", just like raw.first_time
+    assert_allclose(raw.annotations.onset[bad], [1.0])
+    assert_allclose(raw.annotations.duration[bad], [0.5])
+    assert_allclose(raw.annotations.onset[marker][0], 0.0)
+    # converting to events puts the marker at the sample that is at the trigger
+    events, _ = events_from_annotations(raw, event_id={"HDAC006": 1})
+    assert events[0, 0] == 0  # absolute sample index of the trigger (t=0)
+    assert events[1, 0] == round(0.1425 * sfreq)
+    # annotations are not shifted when cropping at the trigger either
+    raw.crop(-raw.first_time, None)
+    assert raw.first_samp == 0
+    assert_allclose(raw.annotations.onset[bad], [1.0])
 
 
 def _read_res4_mag_comp(dsdir):

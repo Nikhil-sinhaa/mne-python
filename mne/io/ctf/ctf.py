@@ -176,6 +176,9 @@ class RawCTF(BaseRaw):
         raw_extras = list()
         missing_names = list()
         no_samps = list()
+        # CTF recordings can start before the sync trigger (t=0) when a pre-trigger
+        # baseline is requested, so the first sample is at -pre_trig_pts
+        first_samps = list()
         while True:
             suffix = "meg4" if len(fnames) == 0 else f"{len(fnames)}_meg4"
             meg4_name, found = _make_ctf_name(directory, suffix, raise_error=False)
@@ -192,9 +195,11 @@ class RawCTF(BaseRaw):
             else:
                 buffer_size_sec = 1.0
             fnames.append(meg4_name)
-            last_samps.append(sample_info["n_samp"] - 1)
+            first_samp = 0 if len(fnames) > 1 else -int(res4["pre_trig_pts"])
+            first_samps.append(first_samp)
+            last_samps.append(first_samp + sample_info["n_samp"] - 1)
+            sample_info["first_samp"] = first_samp
             raw_extras.append(sample_info)
-            first_samps = [0] * len(last_samps)
         if len(fnames) == 0:
             raise OSError(
                 f"Could not find any data, could not find the following "
@@ -213,12 +218,13 @@ class RawCTF(BaseRaw):
             verbose=verbose,
         )
 
-        # Add bad segments as Annotations (correct for start time)
-        start_time = -res4["pre_trig_pts"] / float(info["sfreq"])
-        annot = _annotate_bad_segments(directory, start_time, info["meas_date"])
+        # Add bad segments and markers as Annotations. Their times are relative to
+        # the sync trigger, which is raw.first_time (<= 0 with a pre-trigger baseline)
+        # away from the first sample, so no extra offset is needed here.
+        annot = _annotate_bad_segments(directory, info["meas_date"])
         marker_annot = _read_annotations_ctf_call(
             directory=directory,
-            total_offset=(res4["pre_trig_pts"] / res4["sfreq"]),
+            total_offset=0.0,
             trial_duration=(res4["nsamp"] / res4["sfreq"]),
             meas_date=info["meas_date"],
         )
@@ -231,6 +237,10 @@ class RawCTF(BaseRaw):
         """Read a chunk of raw data."""
         si = self._raw_extras[fi]
         offset = 0
+        # start/stop are relative to first_samp, which can be nonzero; make them
+        # relative to the beginning of the file
+        start -= si["first_samp"]
+        stop -= si["first_samp"]
         trial_start_idx, r_lims, d_lims = _blk_read_lims(
             start, stop, int(si["block_size"])
         )
